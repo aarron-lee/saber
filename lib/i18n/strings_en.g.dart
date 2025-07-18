@@ -796,6 +796,10 @@ class TranslationsSettingsCustomDataDirEn {
 	String get select => 'Select';
 
 	/// en: 'Selected folder must be empty'
+	String get yes => 'Yes';
+	String get grantPermission => "Grant permission";
+	String get grantPermissionExplanation =>
+      "Saber needs permission to access the directory you chose in case you want to modify your notes via any other app (e. g. Syncthing). Do you want to grant this permission?";
 	String get mustBeEmpty => 'Selected folder must be empty';
 
 	/// en: 'Make sure syncing is complete before changing the folder'
