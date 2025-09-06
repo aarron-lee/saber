@@ -1,0 +1,161 @@
+diff --git a/.github/workflows/android.yml b/.github/workflows/android.yml
+index afecd590..6011ba13 100644
+--- a/.github/workflows/android.yml
++++ b/.github/workflows/android.yml
+@@ -69,6 +69,7 @@ jobs:
+       - name: Build apk
+         run: |
+           flutter build apk \
++            --profile \
+             --dart-define=DIRTY=$DIRTY
+         env:
+           DIRTY: ${{ !startsWith(github.ref, 'refs/tags/') }}
+@@ -81,7 +82,7 @@ jobs:
+           echo "apkName=$apkName" >> $GITHUB_OUTPUT
+ 
+           mkdir -p output
+-          mv build/app/outputs/flutter-apk/app-release.apk output/$apkName
++          mv build/app/outputs/flutter-apk/app-profile.apk output/$apkName
+ 
+       - name: Upload artifact
+         uses: actions/upload-artifact@v4
+@@ -89,12 +90,12 @@ jobs:
+           name: Saber-Android
+           path: output/${{ steps.rename_apk.outputs.apkName }}
+ 
+-      - name: Upload to GitHub release
+-        uses: svenstaro/upload-release-action@v2
+-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+-        with:
+-          repo_token: ${{ secrets.GITHUB_TOKEN }}
+-          file: output/${{ steps.rename_apk.outputs.apkName }}
++      # - name: Upload to GitHub release
++      #   uses: svenstaro/upload-release-action@v2
++      #   if: ${{ startsWith(github.ref, 'refs/tags/') }}
++      #   with:
++      #     repo_token: ${{ secrets.GITHUB_TOKEN }}
++      #     file: output/${{ steps.rename_apk.outputs.apkName }}
+ 
+   build-foss-apk:
+     name: Build FOSS APK
+@@ -155,6 +156,7 @@ jobs:
+       - name: Build apk
+         run: |
+           flutter build apk \
++            --profile \
+             --dart-define=DIRTY=$DIRTY
+         env:
+           DIRTY: ${{ !startsWith(github.ref, 'refs/tags/') }}
+@@ -167,7 +169,7 @@ jobs:
+           echo "apkName=$apkName" >> $GITHUB_OUTPUT
+ 
+           mkdir -p output
+-          mv build/app/outputs/flutter-apk/app-release.apk output/$apkName
++          mv build/app/outputs/flutter-apk/app-profile.apk output/$apkName
+ 
+       - name: Upload artifact
+         uses: actions/upload-artifact@v4
+@@ -175,9 +177,9 @@ jobs:
+           name: Saber-Android-FOSS
+           path: output/${{ steps.rename_apk.outputs.apkName }}
+ 
+-      - name: Upload to GitHub release
+-        uses: svenstaro/upload-release-action@v2
+-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+-        with:
+-          repo_token: ${{ secrets.GITHUB_TOKEN }}
+-          file: output/${{ steps.rename_apk.outputs.apkName }}
++      # - name: Upload to GitHub release
++      #   uses: svenstaro/upload-release-action@v2
++      #   if: ${{ startsWith(github.ref, 'refs/tags/') }}
++      #   with:
++      #     repo_token: ${{ secrets.GITHUB_TOKEN }}
++      #     file: output/${{ steps.rename_apk.outputs.apkName }}
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 5bd5c853..25a51da1 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -7,6 +7,8 @@
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+     <!-- Needed for reading files opened with the app -->
+     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
++    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
++
+ 
+     <!-- Install update APKs -->
+     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+diff --git a/lib/components/settings/settings_directory_selector.dart b/lib/components/settings/settings_directory_selector.dart
+index f764714d..ba88243c 100644
+--- a/lib/components/settings/settings_directory_selector.dart
++++ b/lib/components/settings/settings_directory_selector.dart
+@@ -4,6 +4,7 @@ import 'package:file_picker/file_picker.dart';
+ import 'package:flutter/cupertino.dart';
+ import 'package:flutter/material.dart';
+ import 'package:go_router/go_router.dart';
++import 'package:permission_handler/permission_handler.dart';
+ import 'package:saber/components/theming/adaptive_alert_dialog.dart';
+ import 'package:saber/components/theming/font_fallbacks.dart';
+ import 'package:saber/data/file_manager/file_manager.dart';
+@@ -120,9 +121,46 @@ class _DirectorySelectorState extends State<DirectorySelector> {
+     setState(() {});
+   }
+ 
+-  void _onConfirm() {
++  Future<void> requestStoragePermission() async {
++    final status = await Permission.manageExternalStorage.request();
++    if (status.isGranted) {
++      // Permission is granted, no need to do anything
++    } else if (status.isDenied) {
++      // Permission is denied
++      openAppSettings(); // Open app settings to manually grant permission
++    } else if (status.isPermanentlyDenied) {
++      // Permission is permanently denied
++      openAppSettings(); // Open app settings to manually grant permission
++    }
++  }
++
++  void _onConfirm() async {
+     stows.customDataDir.value = _directory;
+     context.pop();
++    if (Platform.isAndroid &&
++        !_directory.startsWith('/data/user/') &&
++        !await Permission.manageExternalStorage.isGranted) {
++      showDialog(
++          context: context,
++          builder: (context) => AdaptiveAlertDialog(
++                  title: Text(t.settings.customDataDir.grantPermission),
++                  content:
++                      Text(t.settings.customDataDir.grantPermissionExplanation),
++                  actions: [
++                    CupertinoDialogAction(
++                      onPressed: () => context.pop(),
++                      child: Text(t.settings.customDataDir.cancel),
++                    ),
++                    CupertinoDialogAction(
++                      isDefaultAction: true,
++                      onPressed: () {
++                        context.pop();
++                        requestStoragePermission();
++                      },
++                      child: Text(t.settings.customDataDir.yes),
++                    ),
++                  ]));
++    }
+   }
+ 
+   @override
+diff --git a/lib/i18n/strings_en.g.dart b/lib/i18n/strings_en.g.dart
+index c227a8c1..87b5e9a9 100644
+--- a/lib/i18n/strings_en.g.dart
++++ b/lib/i18n/strings_en.g.dart
+@@ -796,6 +796,10 @@ class TranslationsSettingsCustomDataDirEn {
+ 	String get select => 'Select';
+ 
+ 	/// en: 'Selected folder must be empty'
++	String get yes => 'Yes';
++	String get grantPermission => "Grant permission";
++	String get grantPermissionExplanation =>
++      "Saber needs permission to access the directory you chose in case you want to modify your notes via any other app (e. g. Syncthing). Do you want to grant this permission?";
+ 	String get mustBeEmpty => 'Selected folder must be empty';
+ 
+ 	/// en: 'Make sure syncing is complete before changing the folder'
