@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     # Only run on the main branch to save cache space,
     # since all other branches can use the main branch's cache.
-    if: github.ref_name == 'main'
-    timeout-minutes: 60
+    # if: github.ref_name == 'main'
+    # timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -224,7 +224,6 @@ jobs:
         if: matrix.foss
       - run: flutter pub get
       - run: ./patches/post/patch_rust_versions.sh
-      - run: ./patches/post/remove_wasm_libs.sh
       - name: Apply custom-dir changes to FOSS build
         if: matrix.foss
         run: ./patches/pre/enable_custom_dir_foss_android.sh
