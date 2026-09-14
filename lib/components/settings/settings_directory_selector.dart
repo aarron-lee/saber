@@ -1,12 +1,9 @@
-import 'dart:io';
-
 import 'package:android_file_picker/android_file_picker.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
-import 'package:saber/components/settings/custom_directory_selector_android.dart';
 import 'package:saber/components/theming/adaptive_alert_dialog.dart';
 import 'package:saber/data/file_manager/file_manager.dart';
 import 'package:saber/data/nextcloud/saber_syncer.dart';
@@ -29,10 +26,9 @@ class SettingsDirectorySelector extends StatelessWidget {
   final bool isUnsupported;
 
   void onPressed(BuildContext context) async {
-    final oldDir = Directory(FileManager.documentsDirectory);
-    final oldDirIsEmpty = oldDir.existsSync()
-        ? oldDir.listSync().isEmpty
-        : true;
+    final oldDirIsEmpty = await FileManager.isDirectoryEmptyAtPath(
+      FileManager.documentsDirectory,
+    );
     await showAdaptiveDialog(
       context: context,
       builder: (context) => DirectorySelector(
@@ -115,9 +111,8 @@ class _DirectorySelectorState extends State<DirectorySelector> {
     if (directory == null) return;
     if (directory == _directory) return;
 
-    final dir = Directory(directory);
     _directory = directory;
-    _isEmpty = dir.existsSync() ? dir.listSync().isEmpty : true;
+    _isEmpty = await FileManager.isDirectoryEmptyAtPath(directory);
 
     if (!mounted) return;
 
@@ -127,20 +122,16 @@ class _DirectorySelectorState extends State<DirectorySelector> {
   Future<void> _pickDefaultDir() async {
     final directory = await FileManager.getDefaultDocumentsDirectory();
 
-    final dir = Directory(directory);
     _directory = directory;
-    _isEmpty = dir.existsSync() ? dir.listSync().isEmpty : true;
+    _isEmpty = await FileManager.isDirectoryEmptyAtPath(directory);
 
     if (!mounted) return;
     setState(() {});
   }
 
-  void _onConfirm() async {
+  void _onConfirm() {
     stows.customDataDir.value = _directory;
     context.pop();
-    if (Platform.isAndroid) {
-      await onConfirmAndroid(context, _directory);
-    }
   }
 
   @override

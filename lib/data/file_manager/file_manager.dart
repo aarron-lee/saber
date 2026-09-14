@@ -13,6 +13,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:saber/components/home/sort_button.dart';
+import 'package:saber/data/file_manager/saf_backend.dart';
 import 'package:saber/data/nextcloud/saber_syncer.dart';
 import 'package:saber/data/prefs.dart';
 import 'package:saber/i18n/strings.g.dart';
@@ -31,7 +32,34 @@ class FileManager {
 
   /// This isn't final because isolates sometimes init multiple times.
   /// Realistically, this value never changes.
+  ///
+  /// This is either a real filesystem path, or (on Android, if the user has
+  /// picked a custom folder) a SAF `content://` tree URI.
   static late String documentsDirectory;
+
+  /// Whether [documentsDirectory] is a SAF tree rather than a real path,
+  /// i.e. whether file operations need to go through [SafBackend].
+  static bool get _isSaf => SafBackend.isSafPath(documentsDirectory);
+
+  /// See [_isSaf].
+  static bool get isSafBackend => _isSaf;
+
+  /// A local cache directory that mirrors files read from a SAF-backed
+  /// [documentsDirectory], so that [getFile] can hand a real path to APIs
+  /// that need one (image/PDF loaders) regardless of backend.
+  ///
+  /// Unused when [documentsDirectory] isn't a SAF tree.
+  ///
+  /// Defaults to an empty string (rather than being `late`) so that reading
+  /// [mirrorRootPath] before [init] runs (e.g. in tests that set
+  /// [documentsDirectory] directly) doesn't throw; it's never actually
+  /// dereferenced unless [documentsDirectory] is a SAF tree.
+  static String _mirrorRootPath = '';
+
+  /// See [_mirrorRootPath]. Isolates that re-run [init] need to be given
+  /// this explicitly, since SAF platform-channel calls (used to compute it
+  /// from scratch) aren't available outside the main isolate.
+  static String get mirrorRootPath => _mirrorRootPath;
 
   static final fileWriteStream = StreamController<FileOperation>.broadcast();
 
@@ -68,10 +96,14 @@ class FileManager {
 
   static Future<void> init({
     String? documentsDirectory,
+    String? mirrorRootPath,
     bool shouldWatchRootDirectory = true,
   }) async {
     FileManager.documentsDirectory =
         documentsDirectory ?? await getDocumentsDirectory();
+    FileManager._mirrorRootPath =
+        mirrorRootPath ??
+        p.join((await getTemporaryDirectory()).path, 'saf_mirror');
 
     if (shouldWatchRootDirectory) unawaited(watchRootDirectory());
   }
@@ -82,31 +114,113 @@ class FileManager {
   static Future<String> getDefaultDocumentsDirectory() async =>
       '${(await getApplicationDocumentsDirectory()).path}/$appRootDirectoryPrefix';
 
-  static Future<void> migrateDataDir() async {
-    final oldDir = Directory(documentsDirectory);
-    final newDir = Directory(await getDocumentsDirectory());
-    if (oldDir.path == newDir.path) return;
-    log.info('Migrating data directory from $oldDir to $newDir');
+  /// Whether the directory at the absolute [path] (a real filesystem path,
+  /// or a SAF `content://` tree URI) is empty or doesn't exist yet.
+  static Future<bool> isDirectoryEmptyAtPath(String path) async {
+    if (SafBackend.isSafPath(path)) {
+      final children = await SafBackend.listChildren(path, '');
+      return children.isEmpty;
+    }
+    final dir = Directory(path);
+    if (!dir.existsSync()) return true;
+    return dir.listSync().isEmpty;
+  }
 
-    late final oldDirEmpty = oldDir.existsSync()
-        ? oldDir.listSync().isEmpty
-        : true;
-    late final newDirEmpty = newDir.existsSync()
-        ? newDir.listSync().isEmpty
-        : true;
+  static Future<void> migrateDataDir() async {
+    final oldRoot = documentsDirectory;
+    final newRoot = await getDocumentsDirectory();
+    if (oldRoot == newRoot) return;
+    log.info('Migrating data directory from $oldRoot to $newRoot');
+
+    final oldRootIsSaf = SafBackend.isSafPath(oldRoot);
+    final newRootIsSaf = SafBackend.isSafPath(newRoot);
+
+    final oldDirEmpty = await isDirectoryEmptyAtPath(oldRoot);
+    final newDirEmpty = await isDirectoryEmptyAtPath(newRoot);
 
     if (!oldDirEmpty && !newDirEmpty) {
       log.severe('New and old data directory aren\'t empty, can\'t migrate');
       return;
     }
 
-    documentsDirectory = newDir.path;
+    documentsDirectory = newRoot;
+
+    if (oldRootIsSaf || newRootIsSaf) {
+      // The mirror cache is keyed by relative path only, so it could hold
+      // stale content left over from a previously-picked SAF directory.
+      final mirrorDir = Directory(_mirrorRootPath);
+      if (mirrorDir.existsSync()) await mirrorDir.delete(recursive: true);
+    }
+
     if (oldDirEmpty) {
       log.fine('Old data directory is empty or missing, nothing to migrate');
-    } else {
-      await moveDirContents(oldDir: oldDir, newDir: newDir);
-      await oldDir.delete(recursive: true);
+      return;
     }
+
+    if (!oldRootIsSaf && !newRootIsSaf) {
+      await moveDirContents(
+        oldDir: Directory(oldRoot),
+        newDir: Directory(newRoot),
+      );
+      await Directory(oldRoot).delete(recursive: true);
+      return;
+    }
+
+    // At least one side is a SAF tree: dart:io can't rename across
+    // backends, so copy bytes across instead.
+    await _migrateTreeContents(oldRoot: oldRoot, newRoot: newRoot);
+    await _deleteTreeContents(oldRoot);
+  }
+
+  static Future<void> _migrateTreeContents({
+    required String oldRoot,
+    required String newRoot,
+  }) async {
+    final oldIsSaf = SafBackend.isSafPath(oldRoot);
+    final newIsSaf = SafBackend.isSafPath(newRoot);
+
+    final relativePaths = <String>[];
+    if (oldIsSaf) {
+      await for (final entry in SafBackend.walk(oldRoot, '')) {
+        if (!entry.file.isDir) relativePaths.add('/${entry.relativePath}');
+      }
+    } else {
+      final dir = Directory(oldRoot);
+      await for (final entity in dir.list(recursive: true)) {
+        if (entity is File) {
+          relativePaths.add(
+            '/${p.relative(entity.path, from: dir.path).replaceAll('\\', '/')}',
+          );
+        }
+      }
+    }
+
+    for (final relativePath in relativePaths) {
+      final bytes = oldIsSaf
+          ? await SafBackend.readBytes(oldRoot, relativePath)
+          : await File(oldRoot + relativePath).readAsBytes();
+      if (bytes == null) continue;
+
+      if (newIsSaf) {
+        await SafBackend.writeBytes(newRoot, relativePath, bytes);
+      } else {
+        final file = File(newRoot + relativePath);
+        await file.parent.create(recursive: true);
+        await file.writeAsBytes(bytes);
+      }
+    }
+  }
+
+  static Future<void> _deleteTreeContents(String root) async {
+    if (SafBackend.isSafPath(root)) {
+      final children = await SafBackend.listChildren(root, '');
+      await Future.wait([
+        for (final child in children) SafBackend.delete(root, '/${child.name}'),
+      ]);
+      return;
+    }
+    final dir = Directory(root);
+    if (dir.existsSync()) await dir.delete(recursive: true);
   }
 
   static Future<void> moveDirContents({
@@ -147,6 +261,11 @@ class FileManager {
 
   @visibleForTesting
   static Future<void> watchRootDirectory() async {
+    // There's no native filesystem-watch API for SAF trees; writes made
+    // through FileManager already broadcast explicitly, so only external
+    // changes to the custom directory go unnoticed.
+    if (_isSaf) return;
+
     final rootDir = Directory(documentsDirectory);
     await rootDir.create(recursive: true);
     if (Platform.isIOS) return;
@@ -186,15 +305,121 @@ class FileManager {
     fileWriteStream.add(FileOperation(type, path));
   }
 
+  // The following private helpers are the single choke point where
+  // FileManager's file-level operations (read/write/delete/move) dispatch
+  // between real dart:io paths and a SAF-backed [documentsDirectory]. They
+  // also keep the local mirror cache (see [_mirrorRootPath]) in sync so
+  // [getFile] can keep returning a real, already-populated File either way.
+
+  static Future<bool> _exists(String filePath) async {
+    if (_isSaf) return SafBackend.exists(documentsDirectory, filePath);
+    return getFile(filePath).existsSync();
+  }
+
+  static Future<void> _writeBytes(String filePath, List<int> bytes) async {
+    if (_isSaf) {
+      await SafBackend.writeBytes(documentsDirectory, filePath, bytes);
+      final mirrorFile = File(_mirrorRootPath + filePath);
+      await mirrorFile.parent.create(recursive: true);
+      await mirrorFile.writeAsBytes(bytes);
+      return;
+    }
+    await getFile(filePath).writeAsBytes(bytes);
+  }
+
+  static Future<void> _delete(String filePath) async {
+    if (_isSaf) {
+      await SafBackend.delete(documentsDirectory, filePath);
+      final mirrorFile = File(_mirrorRootPath + filePath);
+      if (mirrorFile.existsSync()) await mirrorFile.delete();
+      return;
+    }
+    final file = getFile(filePath);
+    if (file.existsSync()) await file.delete();
+  }
+
+  static Future<void> _moveOrRename(String fromPath, String toPath) async {
+    if (_isSaf) {
+      await SafBackend.moveOrRename(documentsDirectory, fromPath, toPath);
+      final fromMirror = File(_mirrorRootPath + fromPath);
+      if (fromMirror.existsSync()) {
+        final toMirror = File(_mirrorRootPath + toPath);
+        await toMirror.parent.create(recursive: true);
+        try {
+          await fromMirror.rename(toMirror.path);
+        } on FileSystemException {
+          // Best-effort; a stale/missing mirror entry just means the next
+          // read re-fetches from the SAF tree.
+        }
+      }
+      return;
+    }
+    final fromFile = getFile(fromPath);
+    final toFile = getFile(toPath);
+    await toFile.parent.create(recursive: true);
+    await fromFile.rename(toFile.path);
+  }
+
+  static Future<void> _mkdir(String folderPath) async {
+    if (_isSaf) {
+      await SafBackend.createDirectory(documentsDirectory, folderPath);
+      return;
+    }
+    await Directory(documentsDirectory + folderPath).create(recursive: true);
+  }
+
+  /// For a SAF-backed [documentsDirectory], copies the document at
+  /// [filePath] into the local mirror cache so [getFile] can hand a real
+  /// path to APIs that need one (image/PDF loaders). No-op otherwise, or if
+  /// no document exists at [filePath].
+  static Future<void> ensureMirrored(String filePath) async {
+    if (!_isSaf) return;
+    final mirrorFile = File(_mirrorRootPath + filePath);
+    if (!await SafBackend.exists(documentsDirectory, filePath)) {
+      if (mirrorFile.existsSync()) await mirrorFile.delete();
+      return;
+    }
+    await mirrorFile.parent.create(recursive: true);
+    await SafBackend.copyToLocalFile(
+      documentsDirectory,
+      filePath,
+      mirrorFile.path,
+    );
+  }
+
+  /// For a SAF-backed [documentsDirectory], mirrors every asset file
+  /// (`$notePath.0`, `$notePath.1`, ..., `$notePath.p`) belonging to the
+  /// note at [notePath] (which must include its extension) into the local
+  /// mirror cache, so they're available as real files by the time the
+  /// note's images are deserialized (possibly on a background isolate).
+  /// No-op otherwise.
+  static Future<void> prefetchNoteAssets(String notePath) async {
+    if (!_isSaf) return;
+
+    final parentPath = notePath.substring(0, notePath.lastIndexOf('/') + 1);
+    final children = await SafBackend.listChildren(
+      documentsDirectory,
+      parentPath,
+    );
+    final assetPrefix = '$notePath.';
+
+    await Future.wait([
+      for (final child in children)
+        if (!child.isDir && '$parentPath${child.name}'.startsWith(assetPrefix))
+          ensureMirrored('$parentPath${child.name}'),
+    ]);
+  }
+
   /// Returns the contents of the file at [filePath].
   static Future<Uint8List?> readFile(String filePath, {int retries = 3}) async {
     filePath = _sanitisePath(filePath);
 
     Uint8List? result;
-    final file = getFile(filePath);
-    if (file.existsSync()) {
-      result = await file.readAsBytes();
-      if (result.isEmpty) result = null;
+    if (await _exists(filePath)) {
+      result = _isSaf
+          ? await SafBackend.readBytes(documentsDirectory, filePath)
+          : await getFile(filePath).readAsBytes();
+      if (result != null && result.isEmpty) result = null;
     } else {
       retries = 0; // don't retry if the file doesn't exist
     }
@@ -222,6 +447,9 @@ class FileManager {
         filePath.startsWith('/'),
         'Expected filePath to start with a slash, got $filePath',
       );
+      // SAF documents can't be addressed by dart:io File under scoped
+      // storage, so hand back a File in the local mirror cache instead.
+      if (_isSaf) return File(_mirrorRootPath + filePath);
       return File(documentsDirectory + filePath);
     }
   }
@@ -246,20 +474,19 @@ class FileManager {
 
     await _saveFileAsRecentlyAccessed(filePath);
 
-    final file = getFile(filePath);
     await _createFileDirectory(filePath);
     Future writeFuture = Future.wait([
-      file.writeAsBytes(toWrite).then((file) async {
-        if (lastModified != null) await file.setLastModified(lastModified);
+      _writeBytes(filePath, toWrite).then((_) async {
+        if (lastModified != null && !_isSaf) {
+          await getFile(filePath).setLastModified(lastModified);
+        }
       }),
       // if we're using a new format, also delete the old file
       if (filePath.endsWith(Editor.extension))
-        getFile(
+        _delete(
           '${filePath.substring(0, filePath.length - Editor.extension.length)}'
           '${Editor.extensionOldJson}',
-        ).delete()
-        // ignore if the file doesn't exist
-        .catchError((_) => File(''), test: (e) => e is PathNotFoundException),
+        ),
     ]);
 
     void afterWrite() {
@@ -279,9 +506,7 @@ class FileManager {
 
   static Future<void> createFolder(String folderPath) async {
     folderPath = _sanitisePath(folderPath);
-
-    final dir = Directory(documentsDirectory + folderPath);
-    await dir.create(recursive: true);
+    await _mkdir(folderPath);
   }
 
   static Future exportFile(
@@ -394,11 +619,8 @@ class FileManager {
 
     if (fromPath == toPath) return toPath;
 
-    final fromFile = getFile(fromPath);
-    final toFile = getFile(toPath);
-    await _createFileDirectory(toPath);
-    if (fromFile.existsSync()) {
-      await fromFile.rename(toFile.path);
+    if (await _exists(fromPath)) {
+      await _moveOrRename(fromPath, toPath);
     } else {
       log.warning('Tried to move non-existent file from $fromPath to $toPath');
     }
@@ -413,19 +635,14 @@ class FileManager {
     if (alsoMoveAssets && !assetFileRegex.hasMatch(fromPath)) {
       final assets = <String>[];
       for (int assetNumber = 0; true; assetNumber++) {
-        final assetFile = getFile('$fromPath.$assetNumber');
-        if (assetFile.existsSync()) {
+        if (await _exists('$fromPath.$assetNumber')) {
           assets.add('$assetNumber');
         } else {
           break;
         }
       }
-      {
-        const assetNumber = 'p';
-        final assetFile = getFile('$fromPath.$assetNumber');
-        if (assetFile.existsSync()) {
-          assets.add(assetNumber);
-        }
+      if (await _exists('$fromPath.p')) {
+        assets.add('p');
       }
 
       await Future.wait([
@@ -448,9 +665,8 @@ class FileManager {
   }) async {
     filePath = _sanitisePath(filePath);
 
-    final file = getFile(filePath);
-    if (!file.existsSync()) return;
-    await file.delete();
+    if (!await _exists(filePath)) return;
+    await _delete(filePath);
 
     if (alsoUpload) syncer.uploader.enqueueRel(filePath);
 
@@ -460,20 +676,18 @@ class FileManager {
     if (alsoDeleteAssets && !assetFileRegex.hasMatch(filePath)) {
       final assets = <int>[];
       for (int assetNumber = 0; true; assetNumber++) {
-        final assetFile = getFile('$filePath.$assetNumber');
-        if (assetFile.existsSync()) {
+        if (await _exists('$filePath.$assetNumber')) {
           assets.add(assetNumber);
         } else {
           break;
         }
       }
 
-      final previewFile = getFile('$filePath.p');
+      final hasPreview = await _exists('$filePath.p');
       await Future.wait([
         for (final assetNumber in assets)
           deleteFile('$filePath.$assetNumber', alsoDeleteAssets: false),
-        if (previewFile.existsSync())
-          deleteFile('$filePath.p', alsoDeleteAssets: false),
+        if (hasPreview) deleteFile('$filePath.p', alsoDeleteAssets: false),
       ]);
     }
   }
@@ -486,7 +700,7 @@ class FileManager {
 
     for (int assetNumber = numAssets; true; assetNumber++) {
       final assetPath = '$filePath.$assetNumber';
-      if (getFile(assetPath).existsSync()) {
+      if (await _exists(assetPath)) {
         futures.add(deleteFile(assetPath));
       } else {
         break;
@@ -499,21 +713,35 @@ class FileManager {
   static Future renameDirectory(String directoryPath, String newName) async {
     directoryPath = _sanitisePath(directoryPath);
 
-    final directory = Directory(documentsDirectory + directoryPath);
-    if (!directory.existsSync()) return;
-
-    /// recursively find children of [directory] for [_renameReferences]
-    final List<String> children = [];
-    await for (final entity in directory.list(recursive: true)) {
-      if (entity is File) {
-        children.add(entity.path.substring(directory.path.length));
-      }
-    }
+    if (!await isDirectory(directoryPath)) return;
 
     final String newPath =
         directoryPath.substring(0, directoryPath.lastIndexOf('/') + 1) +
         newName;
-    await directory.rename(documentsDirectory + newPath);
+
+    /// recursively find children of [directoryPath] for [_renameReferences]
+    final List<String> children = [];
+    if (_isSaf) {
+      await for (final entry in SafBackend.walk(
+        documentsDirectory,
+        directoryPath,
+      )) {
+        if (entry.file.isDir) continue;
+        final child = entry.relativePath.substring(directoryPath.length);
+        children.add(child.startsWith('/') ? child : '/$child');
+      }
+      await SafBackend.moveOrRename(documentsDirectory, directoryPath, newPath);
+      final mirrorDir = Directory(_mirrorRootPath + directoryPath);
+      if (mirrorDir.existsSync()) await mirrorDir.delete(recursive: true);
+    } else {
+      final directory = Directory(documentsDirectory + directoryPath);
+      await for (final entity in directory.list(recursive: true)) {
+        if (entity is File) {
+          children.add(entity.path.substring(directory.path.length));
+        }
+      }
+      await directory.rename(documentsDirectory + newPath);
+    }
 
     for (final child in children) {
       _renameReferences(directoryPath + child, newPath + child);
@@ -528,19 +756,36 @@ class FileManager {
   ]) async {
     directoryPath = _sanitisePath(directoryPath);
 
-    final directory = Directory(documentsDirectory + directoryPath);
-    if (!directory.existsSync()) return;
+    if (!await isDirectory(directoryPath)) return;
 
     if (recursive) {
       // call [deleteFile] on all files that are descendants of the directory
-      await for (final entity in directory.list(recursive: true)) {
-        if (entity is File) {
-          await deleteFile(entity.path.substring(documentsDirectory.length));
+      if (_isSaf) {
+        await for (final entry in SafBackend.walk(
+          documentsDirectory,
+          directoryPath,
+        )) {
+          if (!entry.file.isDir) await deleteFile(entry.relativePath);
+        }
+      } else {
+        final directory = Directory(documentsDirectory + directoryPath);
+        await for (final entity in directory.list(recursive: true)) {
+          if (entity is File) {
+            await deleteFile(entity.path.substring(documentsDirectory.length));
+          }
         }
       }
     }
 
-    await directory.delete(recursive: recursive);
+    if (_isSaf) {
+      await SafBackend.delete(documentsDirectory, directoryPath);
+      final mirrorDir = Directory(_mirrorRootPath + directoryPath);
+      if (mirrorDir.existsSync()) await mirrorDir.delete(recursive: true);
+    } else {
+      await Directory(
+        documentsDirectory + directoryPath,
+      ).delete(recursive: recursive);
+    }
   }
 
   /// Gets the children of a directory, separated into
@@ -571,54 +816,74 @@ class FileManager {
 
     final List<String> directories = [], files = [];
 
-    final dir = Directory(documentsDirectory + directory);
-    if (!dir.existsSync()) return null;
+    if (!await isDirectory(directory)) return null;
 
-    final int directoryPrefixLength = directory.endsWith('/')
-        ? directory.length
-        : directory.length + 1; // +1 for the trailing slash
-    final allChildren = await dir
-        .list()
-        .map((FileSystemEntity entity) {
-          final filePath = entity.path.substring(documentsDirectory.length);
+    final int directoryPrefixLength = directory.length;
 
-          // directories don't need any further processing
-          if (entity is Directory) return filePath;
+    String? processEntry(String filePath, {required bool isDirectoryEntry}) {
+      // directories don't need any further processing
+      if (isDirectoryEntry) return filePath;
 
-          // filter out reserved files
-          if (Editor.isReservedPath(filePath)) return null;
+      // filter out reserved files
+      if (Editor.isReservedPath(filePath)) return null;
 
-          late final isSbn2 = filePath.endsWith(Editor.extension);
-          late final isSbn1 = filePath.endsWith(Editor.extensionOldJson);
+      final isSbn2 = filePath.endsWith(Editor.extension);
+      final isSbn1 = filePath.endsWith(Editor.extensionOldJson);
 
-          if (!includeExtensions) {
-            if (isSbn2) {
-              return filePath.substring(
-                0,
-                filePath.length - Editor.extension.length,
-              );
-            } else if (isSbn1) {
-              return filePath.substring(
-                0,
-                filePath.length - Editor.extensionOldJson.length,
-              );
-            } else {
-              return null; // filePath is name of some asset
-            }
-          } else if (!includeAssets) {
-            final isAsset = !isSbn2 && !isSbn1;
-            if (isAsset) return null;
-          }
+      if (!includeExtensions) {
+        if (isSbn2) {
+          return filePath.substring(
+            0,
+            filePath.length - Editor.extension.length,
+          );
+        } else if (isSbn1) {
+          return filePath.substring(
+            0,
+            filePath.length - Editor.extensionOldJson.length,
+          );
+        } else {
+          return null; // filePath is name of some asset
+        }
+      } else if (!includeAssets) {
+        final isAsset = !isSbn2 && !isSbn1;
+        if (isAsset) return null;
+      }
 
-          return filePath;
-        })
+      return filePath;
+    }
+
+    final List<String?> rawEntries;
+    if (_isSaf) {
+      final children = await SafBackend.listChildren(
+        documentsDirectory,
+        directory,
+      );
+      rawEntries = [
+        for (final child in children)
+          processEntry(
+            '$directory${child.name}',
+            isDirectoryEntry: child.isDir,
+          ),
+      ];
+    } else {
+      final dir = Directory(documentsDirectory + directory);
+      rawEntries = await dir
+          .list()
+          .map((FileSystemEntity entity) {
+            final filePath = entity.path.substring(documentsDirectory.length);
+            return processEntry(filePath, isDirectoryEntry: entity is Directory);
+          })
+          .toList();
+    }
+
+    final allChildren = rawEntries
         .where((String? file) => file != null)
         // remove parent folder
         .map((file) => file!.substring(directoryPrefixLength))
         .toList();
 
     for (final child in allChildren) {
-      if (FileManager.isDirectory(directory + child) &&
+      if (await FileManager.isDirectory(directory + child) &&
           !directories.contains(child)) {
         directories.add(child);
       } else if (!includeAssets && assetFileRegex.hasMatch(child)) {
@@ -636,16 +901,17 @@ class FileManager {
         directories.sort((child, other) => -child.compareTo(other));
         files.sort((child, other) => -child.compareTo(other));
       case .lastModifiedNewToOld:
-        directories.sort();
-        files.sortByCompare(
-          (child) => lastModified(directory + child + Editor.extension),
-          (date, other) => -date.compareTo(other),
-        );
       case .lastModifiedOldToNew:
         directories.sort();
-        files.sortBy(
-          (child) => lastModified(directory + child + Editor.extension),
-        );
+        final modified = <String, DateTime>{
+          for (final child in files)
+            child: await lastModified(directory + child + Editor.extension),
+        };
+        if (sortMetric == SortMetric.lastModifiedNewToOld) {
+          files.sort((a, b) => -modified[a]!.compareTo(modified[b]!));
+        } else {
+          files.sort((a, b) => modified[a]!.compareTo(modified[b]!));
+        }
     }
 
     return DirectoryChildren(directories, files);
@@ -685,7 +951,7 @@ class FileManager {
     if (!stows.recentFiles.loaded) await stows.recentFiles.waitUntilRead();
     // Delete entries for files that have been deleted outside of Saber
     for (final file in stows.recentFiles.value.toList()) {
-      if (!doesFileExist(file)) _removeReferences(file);
+      if (!await doesFileExist(file)) _removeReferences(file);
     }
     return stows.recentFiles.value
         .map((String filePath) {
@@ -711,20 +977,20 @@ class FileManager {
 
   /// Returns whether the [filePath] is a directory or file.
   /// Behaviour is undefined if [filePath] is not a valid path.
-  static bool isDirectory(String filePath) {
+  static Future<bool> isDirectory(String filePath) async {
     filePath = _sanitisePath(filePath);
-    final directory = Directory(documentsDirectory + filePath);
-    return directory.existsSync();
+    if (_isSaf) return SafBackend.isDirectory(documentsDirectory, filePath);
+    return Directory(documentsDirectory + filePath).existsSync();
   }
 
-  static bool doesFileExist(String filePath) {
+  static Future<bool> doesFileExist(String filePath) async {
     filePath = _sanitisePath(filePath);
-    final file = getFile(filePath);
-    return file.existsSync();
+    return _exists(filePath);
   }
 
-  static DateTime lastModified(String filePath) {
+  static Future<DateTime> lastModified(String filePath) async {
     filePath = _sanitisePath(filePath);
+    if (_isSaf) return SafBackend.lastModified(documentsDirectory, filePath);
     final file = getFile(filePath);
     if (!file.existsSync()) return DateTime(2023);
     return file.lastModifiedSync();
@@ -779,8 +1045,8 @@ class FileManager {
 
     int i = 1;
     while (true) {
-      if (!doesFileExist(newFilePath + Editor.extension) &&
-          !doesFileExist(newFilePath + Editor.extensionOldJson))
+      if (!await doesFileExist(newFilePath + Editor.extension) &&
+          !await doesFileExist(newFilePath + Editor.extensionOldJson))
         break;
       if (newFilePath + Editor.extension == currentPath) break;
       if (newFilePath + Editor.extensionOldJson == currentPath) break;
@@ -905,8 +1171,7 @@ class FileManager {
   static Future _createFileDirectory(String filePath) async {
     assert(filePath.contains('/'), 'filePath must be a path, not a file name');
     final parentDirectory = filePath.substring(0, filePath.lastIndexOf('/'));
-    await Directory(documentsDirectory + parentDirectory)
-        .create(recursive: true);
+    await _mkdir(parentDirectory);
   }
 
   static Future _renameReferences(String fromPath, String toPath) async {

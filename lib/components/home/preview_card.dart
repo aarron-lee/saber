@@ -50,9 +50,8 @@ class _PreviewCardState extends State<PreviewCard> {
   void didChangeDependencies() {
     super.didChangeDependencies();
 
-    final imageFile = FileManager.getFile(
-      '${widget.filePath}${Editor.extension}.p',
-    );
+    final previewPath = '${widget.filePath}${Editor.extension}.p';
+    final imageFile = FileManager.getFile(previewPath);
     if (isThisATest) {
       // Avoid FileImages in tests
       thumbnail.image = imageFile.existsSync()
@@ -60,6 +59,15 @@ class _PreviewCardState extends State<PreviewCard> {
           : null;
     } else {
       thumbnail.image = FileImage(imageFile);
+      if (FileManager.isSafBackend) {
+        // The preview may not be mirrored to a real file yet; fetch it and
+        // refresh the thumbnail once it's available.
+        FileManager.ensureMirrored(previewPath).then((_) {
+          if (!mounted) return;
+          thumbnail.image?.evict();
+          thumbnail.markAsChanged();
+        });
+      }
     }
   }
 

@@ -368,6 +368,10 @@ class EditorCoreInfo {
       return EditorCoreInfo(filePath: path);
     }
 
+    await FileManager.prefetchNoteAssets(
+      path + (bsonBytes != null ? Editor.extension : Editor.extensionOldJson),
+    );
+
     return loadFromFileContents(
       jsonString: jsonString,
       bsonBytes: bsonBytes,
@@ -397,6 +401,7 @@ class EditorCoreInfo {
       if (alwaysUseIsolate || length > 2 * 1024 * 1024) {
         // > 2 MB, run on a separate isolate
         final documentsDirectory = FileManager.documentsDirectory;
+        final mirrorRootPath = FileManager.mirrorRootPath;
         coreInfo = await workerManager.execute(
           () async {
             // We need to rerun some "init" methods in the isolate,
@@ -404,6 +409,7 @@ class EditorCoreInfo {
             FlavorConfig.setupFromEnvironment();
             await FileManager.init(
               documentsDirectory: documentsDirectory,
+              mirrorRootPath: mirrorRootPath,
               shouldWatchRootDirectory: false,
             );
             StrokeOptionsExtension.setDefaults();
