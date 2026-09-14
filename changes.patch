@@ -1,0 +1,184 @@
+From dc3e05db7bbeae8d7ff77f335e029848c06b3f51 Mon Sep 17 00:00:00 2001
+From: Aarron Lee <aarron-lee@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 12:15:01 -0400
+Subject: [PATCH] feat(android): fix custom dir
+
+---
+ android/app/src/main/AndroidManifest.xml      |  1 +
+ .../custom_directory_selector_android.dart    | 54 +++++++++++++++++++
+ .../settings/settings_directory_selector.dart | 15 ++++--
+ lib/i18n/strings_en.g.dart                    | 10 ++++
+ ...ustom_directory_selector_android_test.dart | 25 +++++++++
+ 5 files changed, 100 insertions(+), 5 deletions(-)
+ create mode 100644 lib/components/settings/custom_directory_selector_android.dart
+ create mode 100644 test/custom_directory_selector_android_test.dart
+
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 1561c3c4..c4da86a6 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -7,6 +7,7 @@
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+     <!-- Needed for reading files opened with the app -->
+     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
++    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+ 
+     <!-- Remove media permissions from open_filex package -->
+     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove" />
+diff --git a/lib/components/settings/custom_directory_selector_android.dart b/lib/components/settings/custom_directory_selector_android.dart
+new file mode 100644
+index 00000000..a25fce3a
+--- /dev/null
++++ b/lib/components/settings/custom_directory_selector_android.dart
+@@ -0,0 +1,54 @@
++/*
++  This file is for the FOSS Android build only:
++
++  the stub `custom_directory_selector_android.dart`
++  is replaced with this file via the `enable_custom_dir_foss_android.sh` script
++
++  credit for the implementation for the permission selector code goes to @ComputerElite
++  original source PR: https://github.com/saber-notes/saber/pull/1448
++
++*/
++
++import 'package:flutter/cupertino.dart';
++import 'package:flutter/material.dart';
++import 'package:go_router/go_router.dart';
++import 'package:permission_handler/permission_handler.dart';
++import 'package:saber/components/theming/adaptive_alert_dialog.dart';
++import 'package:saber/i18n/strings.g.dart';
++
++bool isCustomDirSupported() => true;
++
++Future<void> requestStoragePermission() async {
++  final status = await Permission.manageExternalStorage.request();
++  if (status.isDenied || status.isPermanentlyDenied) {
++    openAppSettings();
++  }
++}
++
++Future<void> onConfirmAndroid(BuildContext context, String directory) async {
++  if (directory.startsWith('/data/user/')) return;
++  if (await Permission.manageExternalStorage.isGranted) return;
++  if (!context.mounted) return;
++
++  showDialog(
++    context: context,
++    builder: (context) => AdaptiveAlertDialog(
++      title: Text(t.settings.customDataDir.grantPermission),
++      content: Text(t.settings.customDataDir.grantPermissionExplanation),
++      actions: [
++        CupertinoDialogAction(
++          onPressed: () => context.pop(),
++          child: Text(t.settings.customDataDir.cancel),
++        ),
++        CupertinoDialogAction(
++          isDefaultAction: true,
++          onPressed: () {
++            context.pop();
++            requestStoragePermission();
++          },
++          child: Text(t.settings.customDataDir.yes),
++        ),
++      ],
++    ),
++  );
++}
+diff --git a/lib/components/settings/settings_directory_selector.dart b/lib/components/settings/settings_directory_selector.dart
+index 048f96ad..a920aded 100644
+--- a/lib/components/settings/settings_directory_selector.dart
++++ b/lib/components/settings/settings_directory_selector.dart
+@@ -6,6 +6,7 @@ import 'package:flutter/cupertino.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:go_router/go_router.dart';
++import 'package:saber/components/settings/custom_directory_selector_android.dart';
+ import 'package:saber/components/theming/adaptive_alert_dialog.dart';
+ import 'package:saber/data/file_manager/file_manager.dart';
+ import 'package:saber/data/nextcloud/saber_syncer.dart';
+@@ -134,9 +135,12 @@ class _DirectorySelectorState extends State<DirectorySelector> {
+     setState(() {});
+   }
+ 
+-  void _onConfirm() {
++  void _onConfirm() async {
+     stows.customDataDir.value = _directory;
+     context.pop();
++    if (Platform.isAndroid) {
++      await onConfirmAndroid(context, _directory);
++    }
+   }
+ 
+   @override
+@@ -154,10 +158,11 @@ class _DirectorySelectorState extends State<DirectorySelector> {
+       content: Column(
+         mainAxisSize: .min,
+         children: [
+-          Text(
+-            t.settings.customDataDir.unsupported,
+-            style: TextStyle(color: colorScheme.error),
+-          ),
++          if (!isCustomDirSupported())
++            Text(
++              t.settings.customDataDir.unsupported,
++              style: TextStyle(color: colorScheme.error),
++            ),
+           Row(
+             children: [
+               Expanded(
+diff --git a/lib/i18n/strings_en.g.dart b/lib/i18n/strings_en.g.dart
+index 78a0d878..fece1ae5 100644
+--- a/lib/i18n/strings_en.g.dart
++++ b/lib/i18n/strings_en.g.dart
+@@ -859,6 +859,16 @@ class Translations$settings$customDataDir$en {
+ 	/// en: 'Select'
+ 	String get select => 'Select';
+ 
++	/// en: 'Yes'
++	String get yes => 'Yes';
++
++	/// en: 'Grant permission'
++	String get grantPermission => "Grant permission";
++
++	/// en: 'Saber needs permission to access the directory you chose. Do you want to grant this permission?'
++	String get grantPermissionExplanation =>
++      "Saber needs permission to access the directory you chose. Do you want to grant this permission?";
++
+ 	/// en: 'Selected folder must be empty'
+ 	String get mustBeEmpty => 'Selected folder must be empty';
+ 
+diff --git a/test/custom_directory_selector_android_test.dart b/test/custom_directory_selector_android_test.dart
+new file mode 100644
+index 00000000..402a97ef
+--- /dev/null
++++ b/test/custom_directory_selector_android_test.dart
+@@ -0,0 +1,25 @@
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:saber/components/settings/custom_directory_selector_android.dart';
++
++void main() {
++  group('custom_directory_selector_android', () {
++    test('isCustomDirSupported returns true', () {
++      expect(isCustomDirSupported(), true);
++    });
++
++    testWidgets(
++      'onConfirmAndroid returns early for /data/user/ paths and shows no dialog',
++      (tester) async {
++        await tester.pumpWidget(const MaterialApp(home: SizedBox()));
++        final context = tester.element(find.byType(SizedBox));
++
++        // Paths under /data/user/ are internal app storage; no permission needed.
++        await onConfirmAndroid(context, '/data/user/0/com.example.saber/files');
++
++        await tester.pump();
++        expect(find.byType(AlertDialog), findsNothing);
++      },
++    );
++  });
++}
+-- 
+2.54.0
+
