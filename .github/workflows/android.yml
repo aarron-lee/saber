@@ -80,6 +80,7 @@ jobs:
 
       - run: ./patches/pre/remove_proprietary_dependencies.sh
         if: matrix.foss
+      - run: ./patches/pre/fix_custom_dir.sh
       - run: patch pubspec.lock < patches/pre/pubspec-fdroid.lock.patch
         if: matrix.foss
 
